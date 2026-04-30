@@ -1,0 +1,43 @@
+name: exoplanet-tfm
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python base
+  - python=3.11
+  
+  # Astronomía core
+  - astropy>=5.3
+  - ccdproc>=2.4
+  - photutils>=1.9
+  - lightkurve>=2.4
+  
+  # Análisis numérico
+  - numpy>=1.24
+  - scipy>=1.10
+  - pandas>=2.0
+  
+  # Visualización
+  - matplotlib>=3.7
+  - seaborn>=0.12
+  
+  # Machine Learning
+  - scikit-learn>=1.3
+  
+  # Estadística bayesiana
+  - emcee>=3.1
+  - corner>=2.2
+  
+  # Desarrollo
+  - jupyter>=1.0
+  - ipython>=8.12
+  - pytest>=7.4
+  - black>=23.0
+  
+  # Instalaciones via pip
+  - pip>=23.0
+  - pip:
+    - batman-package>=2.4.9
+    - pytransit>=2.6
+    - allesfitter>=1.2
+    - dynesty>=2.1
