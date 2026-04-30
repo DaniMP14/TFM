@@ -16,6 +16,7 @@ FRAME_ALIASES = {
     "flat": {"flat", "flats", "field", "skyflat", "flatfield"},
     "light": {"light", "object", "science", "target"},
 }
+DEFAULT_FILTER = "R"
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,7 @@ def get_filter_name(header: fits.Header) -> str | None:
         value = header.get(key)
         if value not in (None, ""):
             return str(value).strip()
-    return None
+    return DEFAULT_FILTER
 
 
 def get_exposure_time(header: fits.Header) -> float | None:
