@@ -1,0 +1,17 @@
+# Credenciales - NUNCA subir
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Datos grandes
+*.fits
+*.fit
+*.fts
+*.fz

@@ -10,6 +10,7 @@ dependencies:
   - astropy>=5.3
   - ccdproc>=2.4
   - photutils>=1.9
+  - astroquery>=0.4.7
   - lightkurve>=2.4
   
   # Análisis numérico
@@ -34,6 +35,9 @@ dependencies:
   - pytest>=7.4
   - black>=23.0
   
+  # Variables de entorno
+  - python-dotenv>=1.0
+
   # Instalaciones via pip
   - pip>=23.0
   - pip:
