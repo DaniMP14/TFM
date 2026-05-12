@@ -83,12 +83,16 @@ def choose_comparison_sources(
     max_comparisons: int = 5,
     min_separation: float = 20.0,
     min_edge_distance: float = 25.0,
+    min_neighbor_distance: float = 0.0,
+    brightness_range: tuple[float, float] = (0.5, 2.0),
 ) -> list[dict[str, float]]:
     height, width = image_shape
     target_flux = max(target_source["flux"], 1e-12)
+    source_list = list(sources)
+    brightness_min, brightness_max = brightness_range
 
     candidates: list[tuple[float, dict[str, float]]] = []
-    for source in sources:
+    for source in source_list:
         if source is target_source:
             continue
 
@@ -101,8 +105,26 @@ def choose_comparison_sources(
         if distance < min_separation:
             continue
 
-        brightness_ratio = abs(np.log10(max(source["flux"], 1e-12) / target_flux))
-        score = brightness_ratio + 0.001 * distance
+        if min_neighbor_distance > 0.0:
+            nearest_neighbor_distance = min(
+                float(np.hypot(source["x"] - other["x"], source["y"] - other["y"]))
+                for other in source_list
+                if other is not source
+            )
+            if nearest_neighbor_distance < min_neighbor_distance:
+                continue
+
+        flux_ratio = max(source["flux"], 1e-12) / target_flux
+        
+        # Rechaza estrellas fuera del rango permitido
+        if flux_ratio < brightness_min or flux_ratio > brightness_max:
+            continue
+
+        # Dentro del rango: penaliza por distancia del centro del rango en log
+        range_center = np.sqrt(brightness_min * brightness_max)  # media geométrica
+        brightness_penalty = abs(np.log10(flux_ratio / range_center))
+
+        score = brightness_penalty + 0.001 * distance
         candidates.append((score, source))
 
     candidates.sort(key=lambda item: item[0])

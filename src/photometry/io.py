@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.time import Time
 from astropy.wcs import WCS
+from astropy.wcs import FITSFixedWarning
 
 from reduction.io import get_exposure_time
 
@@ -45,6 +47,12 @@ def load_alignment_summary(summary_path: str | Path | None) -> pd.DataFrame | No
         return None
 
     return pd.read_csv(path)
+
+
+def _read_header_silently(path: str | Path) -> fits.Header:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        return fits.getheader(path)
 
 
 def extract_time_jd(header: fits.Header) -> float | None:
@@ -86,7 +94,7 @@ def index_aligned_frames(
         if allowed_files is not None and original_name not in allowed_files:
             continue
 
-        header = fits.getheader(path)
+        header = _read_header_silently(path)
         records.append(
             AlignedFrameRecord(
                 path=path,
@@ -107,7 +115,9 @@ def _parse_sexagesimal_coord(ra_str: str, dec_str: str) -> tuple[float, float]:
 
 def _header_to_celestial_wcs(header: fits.Header) -> WCS | None:
     try:
-        wcs = WCS(header)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            wcs = WCS(header)
     except Exception:
         return None
     return wcs if wcs.has_celestial else None
@@ -125,7 +135,7 @@ def _load_sidecar_wcs(reference_frame_path: str | Path, wcs_cache_dir: str | Pat
         return None
 
     try:
-        sidecar_header = fits.getheader(sidecar_path)
+        sidecar_header = _read_header_silently(sidecar_path)
     except Exception:
         return None
 
@@ -313,8 +323,6 @@ def _resolve_target_xy_approx(
     return float(target_x), float(target_y)
 
 
-# La función resolve_target_xy es la función principal que combina la consulta a SIMBAD, la lectura del encabezado FITS y el cálculo de la posición en píxeles del objetivo.
-# Es fundamental para la configuración de la fotometría, ya que permite determinar dónde se encuentra el objetivo en la imagen para realizar las mediciones de flujo correctamente.
 def resolve_target_xy(
     reference_frame_path: str | Path,
     object_name: str,
@@ -341,7 +349,7 @@ def resolve_target_xy(
         raise ValueError(f"SIMBAD could not resolve object name: '{object_name}'")
     target_coord = _simbad_result_to_coord(result)
 
-    header = fits.getheader(reference_frame_path)
+    header = _read_header_silently(reference_frame_path)
 
     if prefer_wcs:
         if wcs_solver not in {"auto", "none", "local", "online"}:

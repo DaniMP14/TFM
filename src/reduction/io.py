@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -7,6 +9,7 @@ from typing import Iterable
 import numpy as np
 from astropy.io import fits
 from astropy.nddata import CCDData
+from astropy.wcs import FITSFixedWarning
 import astropy.units as u
 
 SUPPORTED_SUFFIXES = {".fits", ".fit", ".fts", ".fz"}
@@ -55,11 +58,28 @@ def infer_frame_type(path: str | Path, header: fits.Header | None = None) -> str
 
 
 def load_header(path: str | Path) -> fits.Header:
-    return fits.getheader(path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        return fits.getheader(path)
 
 
 def load_ccd(path: str | Path, unit: str = "adu") -> CCDData:
-    return CCDData.read(path, unit=unit)
+    # Algunos FITS reducidos guardan la imagen en una extensión distinta del PRIMARY.
+    # CCDData.read() intenta por defecto leer la primera HDU, así que resolvemos
+    # automáticamente la primera extensión que realmente contiene datos de imagen.
+    ccd_logger = logging.getLogger("astropy.nddata.ccddata")
+    previous_level = ccd_logger.level
+    ccd_logger.setLevel(logging.ERROR)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        with fits.open(path) as hdul:
+            hdu_index = next((i for i, hdu in enumerate(hdul) if getattr(hdu, "data", None) is not None), 0)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            return CCDData.read(path, unit=unit, hdu=hdu_index)
+    finally:
+        ccd_logger.setLevel(previous_level)
 
 
 def get_filter_name(header: fits.Header) -> str | None:
