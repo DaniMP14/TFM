@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 from astropy.nddata import CCDData
-from scipy import ndimage, signal
+from scipy import ndimage
+from skimage.registration import phase_cross_correlation
 
 
 @dataclass(frozen=True)
@@ -13,13 +14,14 @@ class ShiftEstimate:
     dy: float
     peak_value: float
 
-# Toma dos imágenes (referencia y móvil) y calcula la correlación cruzada usando FFT (Transformada Rápida de Fourier) para encontrar el desplazamiento que maximiza la correlación.
-# Limita la búsqueda a un área alrededor del centro para evitar desplazamientos excesivos.
-# Devuelve el desplazamiento estimado en píxeles (dx, dy) y el valor de la correlación en ese punto.
-def estimate_integer_shift(
+# Calcula el desplazamiento subpixel entre dos imágenes usando phase_cross_correlation
+# (correlación cruzada en espacio de frecuencias con upsampling). Precisión ~1/upsample_factor px.
+# Rechaza desplazamientos que superen max_shift para evitar saltos erróneos.
+def estimate_subpixel_shift(
     reference: np.ndarray,
     moving: np.ndarray,
     max_shift: int = 50,
+    upsample_factor: int = 10,
 ) -> ShiftEstimate:
     ref = np.asarray(reference, dtype=float)
     mov = np.asarray(moving, dtype=float)
@@ -30,26 +32,29 @@ def estimate_integer_shift(
     ref = ref - np.median(ref)
     mov = mov - np.median(mov)
 
-    corr = signal.fftconvolve(ref, mov[::-1, ::-1], mode="same")
+    result = phase_cross_correlation(
+        ref, mov,
+        upsample_factor=upsample_factor,
+        normalization=None,
+    )
+    # skimage >= 0.19 devuelve (shift, error, phasediff); >= 0.21 puede devolver solo shift
+    shift_arr = result[0] if isinstance(result, tuple) else result
+    dy, dx = float(shift_arr[0]), float(shift_arr[1])
 
-    center_y = corr.shape[0] // 2
-    center_x = corr.shape[1] // 2
+    if abs(dx) > max_shift or abs(dy) > max_shift:
+        raise ValueError(
+            f"Desplazamiento estimado ({dx:.2f}, {dy:.2f}) supera max_shift={max_shift} px."
+        )
 
-    y_min = max(center_y - max_shift, 0)
-    y_max = min(center_y + max_shift + 1, corr.shape[0])
-    x_min = max(center_x - max_shift, 0)
-    x_max = min(center_x + max_shift + 1, corr.shape[1])
+    # peak_value: norma inversa del error de fase (1.0 = correlación perfecta)
+    error = float(result[1]) if isinstance(result, tuple) and len(result) > 1 else 0.0
+    peak_value = 1.0 - error
 
-    local_corr = corr[y_min:y_max, x_min:x_max]
-    peak_y_local, peak_x_local = np.unravel_index(np.argmax(local_corr), local_corr.shape)
+    return ShiftEstimate(dx=dx, dy=dy, peak_value=peak_value)
 
-    peak_y = y_min + peak_y_local
-    peak_x = x_min + peak_x_local
 
-    dy = float(peak_y - center_y)
-    dx = float(peak_x - center_x)
-
-    return ShiftEstimate(dx=dx, dy=dy, peak_value=float(corr[peak_y, peak_x]))
+# Alias de compatibilidad
+estimate_integer_shift = estimate_subpixel_shift
 
 # Toma un CCDData y aplica el desplazamiento usando interpolación (por defecto cúbica) para alinear la imagen. 
 # Preserva la unidad y el encabezado, añadiendo información sobre el desplazamiento aplicado.
@@ -57,7 +62,7 @@ def apply_shift(
     ccd: CCDData,
     dx: float,
     dy: float,
-    order: int = 3,
+    order: int = 1,
 ) -> CCDData:
     shifted = ndimage.shift(
         ccd.data.astype(float),

@@ -20,6 +20,7 @@ from photometry.aperture import (  # noqa: E402
     measure_aperture_flux,
 )
 from photometry.differential import build_differential_light_curve  # noqa: E402
+from photometry.detrending import estimate_transit_mask, normalize_to_baseline  # noqa: E402
 from photometry.io import index_aligned_frames, resolve_target_xy  # noqa: E402
 from reduction.io import load_ccd  # noqa: E402
 
@@ -52,15 +53,100 @@ class PhotometryConfig:
     min_neighbor_distance: float | None = None
     comparison_brightness_range: tuple[float, float] = (0.3, 3.0)
     aperture_radius: float | None = None
-    aperture_scale: float = 1.5
+    aperture_scale: float = 1.7
     annulus_scale_inner: float = 1.7
     annulus_scale_outer: float = 2.4
     adaptive_photometry: bool = True
     recenter_sources_per_frame: bool = True
-    centroid_box_size: int = 15
+    centroid_box_size: int = 10
     aperture_radius_min: float = 2.0
     aperture_radius_max: float = 20.0
     fwhm_clip_range: tuple[float, float] = (1.5, 12.0) # in pixels; used to filter out sources with unrealistic FWHM estimates
+    remove_oot_outliers: bool = True
+    oot_outlier_sigma: float = 3.0
+    oot_outlier_upper_only: bool = False # if True, only remove outliers above the baseline
+    oot_baseline_percentile_range: tuple[float, float] = (0.0, 30.0)
+    oot_transit_threshold_sigma: float = 1.8
+
+
+def _compute_rms_oot(
+    light_curve_df: pd.DataFrame,
+    baseline_percentile_range: tuple[float, float],
+    transit_threshold_sigma: float,
+) -> float | None:
+    if light_curve_df.empty or "relative_flux" not in light_curve_df.columns:
+        return None
+
+    lc_norm = normalize_to_baseline(
+        light_curve_df,
+        relative_flux_column="relative_flux",
+        baseline_percentile_range=baseline_percentile_range,
+    )
+    transit_mask = estimate_transit_mask(
+        lc_norm,
+        normalized_flux_column="normalized_flux",
+        threshold_sigma=transit_threshold_sigma,
+    )
+    oot_mask = ~np.asarray(transit_mask, dtype=bool)
+    if int(np.sum(oot_mask)) < 3:
+        return None
+
+    residuals_oot = lc_norm.loc[oot_mask, "normalized_flux"].to_numpy(dtype=float) - 1.0
+    return float(np.std(residuals_oot, ddof=1))
+
+
+def _remove_oot_outliers(
+    light_curve_df: pd.DataFrame,
+    sigma_threshold: float,
+    upper_only: bool,
+    baseline_percentile_range: tuple[float, float],
+    transit_threshold_sigma: float,
+) -> tuple[pd.DataFrame, int]:
+    if light_curve_df.empty:
+        return light_curve_df.copy(), 0
+
+    required = {"relative_flux", "differential_flux"}
+    if not required.issubset(light_curve_df.columns):
+        return light_curve_df.copy(), 0
+
+    lc_norm = normalize_to_baseline(
+        light_curve_df,
+        relative_flux_column="relative_flux",
+        baseline_percentile_range=baseline_percentile_range,
+    )
+    transit_mask = estimate_transit_mask(
+        lc_norm,
+        normalized_flux_column="normalized_flux",
+        threshold_sigma=transit_threshold_sigma,
+    )
+    oot_mask = ~np.asarray(transit_mask, dtype=bool)
+    if int(np.sum(oot_mask)) < 8:
+        return light_curve_df.copy(), 0
+
+    oot_flux = lc_norm.loc[oot_mask, "normalized_flux"].to_numpy(dtype=float)
+    center = float(np.median(oot_flux))
+    scatter = float(np.std(oot_flux, ddof=1))
+    if not np.isfinite(scatter) or scatter <= 0.0:
+        return light_curve_df.copy(), 0
+
+    if upper_only:
+        oot_outliers = oot_flux > (center + sigma_threshold * scatter)
+    else:
+        oot_outliers = np.abs(oot_flux - center) > (sigma_threshold * scatter)
+
+    full_mask = np.zeros(len(lc_norm), dtype=bool)
+    full_mask[np.where(oot_mask)[0]] = oot_outliers
+    n_removed = int(np.sum(full_mask))
+    if n_removed == 0:
+        return light_curve_df.copy(), 0
+
+    filtered = light_curve_df.loc[~full_mask].copy()
+    if not filtered.empty:
+        baseline = float(filtered["differential_flux"].median())
+        if np.isfinite(baseline) and baseline > 0.0:
+            filtered["relative_flux"] = filtered["differential_flux"] / baseline
+
+    return filtered.reset_index(drop=True), n_removed
 
 
 def _build_reference_catalog(
@@ -365,8 +451,44 @@ def run_photometry_pipeline(
     measurement_table = Table.from_pandas(measurement_df)
     measurement_table.write(paths.output_dir / "aperture_photometry.csv", format="csv", overwrite=True)
 
-    light_curve_df = build_differential_light_curve(measurement_df)
-    light_curve_table = Table.from_pandas(light_curve_df)
+    light_curve_df_raw = build_differential_light_curve(measurement_df)
+    light_curve_df_raw.to_csv(paths.output_dir / "differential_light_curve_raw.csv", index=False)
+
+    light_curve_df_final = light_curve_df_raw.copy()
+    rms_oot_before = _compute_rms_oot(
+        light_curve_df_raw,
+        baseline_percentile_range=config.oot_baseline_percentile_range,
+        transit_threshold_sigma=config.oot_transit_threshold_sigma,
+    )
+
+    n_removed = 0
+    if config.remove_oot_outliers:
+        light_curve_df_final, n_removed = _remove_oot_outliers(
+            light_curve_df_raw,
+            sigma_threshold=config.oot_outlier_sigma,
+            upper_only=config.oot_outlier_upper_only,
+            baseline_percentile_range=config.oot_baseline_percentile_range,
+            transit_threshold_sigma=config.oot_transit_threshold_sigma,
+        )
+
+    rms_oot_after = _compute_rms_oot(
+        light_curve_df_final,
+        baseline_percentile_range=config.oot_baseline_percentile_range,
+        transit_threshold_sigma=config.oot_transit_threshold_sigma,
+    )
+
+    if config.remove_oot_outliers:
+        before_txt = f"{rms_oot_before * 1000.0:.3f}" if rms_oot_before is not None else "nan"
+        after_txt = f"{rms_oot_after * 1000.0:.3f}" if rms_oot_after is not None else "nan"
+        print(
+            "[photometry] OOT outlier clipping: "
+            f"removed={n_removed}, sigma={config.oot_outlier_sigma:.2f}, "
+            f"upper_only={config.oot_outlier_upper_only}, "
+            f"RMS_OOT_before={before_txt} mmag, RMS_OOT_after={after_txt} mmag"
+        )
+
+    light_curve_df_final.to_csv(paths.output_dir / "differential_light_curve_clean.csv", index=False)
+    light_curve_table = Table.from_pandas(light_curve_df_final)
     light_curve_table.write(paths.output_dir / "differential_light_curve.csv", format="csv", overwrite=True)
     return light_curve_table
 

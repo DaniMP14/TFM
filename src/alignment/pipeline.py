@@ -15,7 +15,7 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 from reduction.io import load_ccd  # noqa: E402
-from alignment.registration import apply_shift, estimate_integer_shift  # noqa: E402
+from alignment.registration import apply_shift, estimate_subpixel_shift  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -94,7 +94,7 @@ def _estimate_shifts(
         if index == 0 and config.reference_strategy == "first":
             dx, dy, peak_value = 0.0, 0.0, 0.0
         else:
-            shift = estimate_integer_shift(
+            shift = estimate_subpixel_shift(
                 reference=reference_data,
                 moving=ccd.data.astype(float),
                 max_shift=config.max_shift,
