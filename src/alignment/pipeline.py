@@ -26,12 +26,14 @@ class AlignmentPaths:
 
 @dataclass(frozen=True)
 class AlignmentConfig:
-    max_shift: int = 50  # maximum pixel shift to search in each direction
+    max_shift: int = 100  # maximum pixel shift to search in each direction
     interpolation_order: int = 3  # cubic interpolation
     reference_strategy: str = "first"  # "first" or "median"
+    shift_mode: str = "previous"  # "previous" (incremental) or "global"
     include_reference_in_output: bool = True
     two_pass: bool = True
-    corr_low_quantile: float = 0.10
+    corr_hard_threshold: float = 0.4
+    corr_soft_threshold: float = 0.7
     jump_threshold: float = 5.0
 
 
@@ -88,18 +90,48 @@ def _estimate_shifts(
     config: AlignmentConfig,
 ) -> list[dict[str, Any]]:
     estimates: list[dict[str, Any]] = []
+    previous_data: np.ndarray | None = None
+    cumulative_dx = 0.0
+    cumulative_dy = 0.0
+
     for index, file_path in enumerate(files):
         ccd = load_ccd(file_path)
+        current_data = ccd.data.astype(float)
+
+        shift_error = False
+        shift_error_msg = ""
 
         if index == 0 and config.reference_strategy == "first":
-            dx, dy, peak_value = 0.0, 0.0, 0.0
+            dx, dy, peak_value = 0.0, 0.0, 1.0
         else:
-            shift = estimate_subpixel_shift(
-                reference=reference_data,
-                moving=ccd.data.astype(float),
-                max_shift=config.max_shift,
-            )
-            dx, dy, peak_value = shift.dx, shift.dy, shift.peak_value
+            try:
+                if config.shift_mode == "previous" and previous_data is not None:
+                    reference_for_shift = previous_data
+                else:
+                    reference_for_shift = reference_data
+
+                shift = estimate_subpixel_shift(
+                    reference=reference_for_shift,
+                    moving=current_data,
+                    max_shift=config.max_shift,
+                )
+
+                if config.shift_mode == "previous":
+                    cumulative_dx += float(shift.dx)
+                    cumulative_dy += float(shift.dy)
+                    dx, dy = cumulative_dx, cumulative_dy
+                else:
+                    dx, dy = float(shift.dx), float(shift.dy)
+
+                peak_value = float(shift.peak_value)
+            except ValueError as exc:
+                # Keep the pipeline running: this frame will be flagged/rejected downstream.
+                dx, dy, peak_value = 0.0, 0.0, -1.0
+                shift_error = True
+                shift_error_msg = str(exc)
+                print(f"Warning: shift estimation failed for '{file_path.name}': {exc}")
+
+        previous_data = current_data
 
         estimates.append(
             {
@@ -107,6 +139,8 @@ def _estimate_shifts(
                 "dx": dx,
                 "dy": dy,
                 "corr_peak": peak_value,
+                "shift_error": shift_error,
+                "shift_error_msg": shift_error_msg,
             }
         )
     return estimates
@@ -122,22 +156,31 @@ def _compute_jumps(estimates: list[dict[str, Any]]) -> np.ndarray:
 
 def _detect_bad_indices(
     estimates: list[dict[str, Any]],
-    corr_low_quantile: float,
+    corr_hard_threshold: float,
+    corr_soft_threshold: float,
     jump_threshold: float,
 ) -> tuple[set[int], np.ndarray, np.ndarray, float]:
     corr = np.array([float(item["corr_peak"]) for item in estimates], dtype=float)
     jumps = _compute_jumps(estimates)
 
-    corr_threshold = float(np.quantile(corr, corr_low_quantile))
-    low_corr = corr < corr_threshold
+    low_corr = corr < corr_soft_threshold
 
-    # Causal pattern: low correlation in frame N followed by large jump in N+1.
-    bad_indices: set[int] = set()
-    for i in range(len(estimates) - 1):
-        if low_corr[i] and jumps[i + 1] > jump_threshold:
+    # Always reject frames where shift estimation itself failed.
+    bad_indices: set[int] = {
+        i for i, item in enumerate(estimates) if bool(item.get("shift_error", False))
+    }
+
+    # Reject very low-correlation frames regardless of jump.
+    for i in range(len(estimates)):
+        if corr[i] < corr_hard_threshold:
             bad_indices.add(i)
 
-    return bad_indices, jumps, low_corr, corr_threshold
+    # Reject low-correlation frames when they also show a large alignment jump.
+    for i in range(len(estimates)):
+        if corr[i] < corr_soft_threshold and jumps[i] > jump_threshold:
+            bad_indices.add(i)
+
+    return bad_indices, jumps, low_corr, corr_soft_threshold
 
 
 def _write_aligned_frames(
@@ -150,6 +193,10 @@ def _write_aligned_frames(
         ccd = load_ccd(file_path)
         dx = float(item["dx"])
         dy = float(item["dy"])
+
+        if bool(item.get("shift_error", False)):
+            print(f"Warning: skipping '{file_path.name}' due to shift estimation failure.")
+            continue
 
         if index == 0 and config.reference_strategy == "first":
             if config.include_reference_in_output:
@@ -182,7 +229,8 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
     if config.two_pass:
         bad_indices, pass1_jumps, pass1_low_corr, corr_threshold = _detect_bad_indices(
             pass1_estimates,
-            corr_low_quantile=config.corr_low_quantile,
+            corr_hard_threshold=config.corr_hard_threshold,
+            corr_soft_threshold=config.corr_soft_threshold,
             jump_threshold=config.jump_threshold,
         )
 
@@ -207,6 +255,11 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
             dy = float(pass1_item["dy"])
             corr_peak = float(pass1_item["corr_peak"])
             status = "rejected_prealign"
+        elif bool(aligned_item.get("shift_error", False)):
+            dx = float(aligned_item["dx"])
+            dy = float(aligned_item["dy"])
+            corr_peak = float(aligned_item["corr_peak"])
+            status = "failed_alignment"
         else:
             dx = float(aligned_item["dx"])
             dy = float(aligned_item["dy"])
@@ -225,6 +278,7 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
                 "pass1_low_corr": bool(pass1_low_corr[i]),
                 "rejected": bool(was_rejected),
                 "corr_threshold": corr_threshold,
+                "pass1_shift_error": bool(pass1_item.get("shift_error", False)),
             }
         )
 

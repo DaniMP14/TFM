@@ -35,7 +35,7 @@ class PhotometryPaths:
 @dataclass(frozen=True)
 class PhotometryConfig:
     target_xy: tuple[float, float] | None = None
-    object_name: str = "Qatar-1"  # used for SIMBAD lookup if target_xy is not provided
+    object_name: str = "WASP-2"  # used for SIMBAD lookup if target_xy is not provided
     pixel_scale_arcsec: float | None = None  # arcsec/px; optional if FITS has XPIXSZ/FOCALLEN
     prefer_wcs: bool = True
     wcs_solver: str = "auto"  # auto | none | local | online
@@ -47,13 +47,13 @@ class PhotometryConfig:
     detection_threshold_sigma: float = 5.0
     exclude_border: int = 15
     brightest_sources: int | None = 200
-    max_comparisons: int = 12
+    max_comparisons: int = 5
     min_source_separation: float = 20.0
     min_edge_distance: float = 25.0
     min_neighbor_distance: float | None = None
     comparison_brightness_range: tuple[float, float] = (0.3, 3.0)
     aperture_radius: float | None = None
-    aperture_scale: float = 1.7
+    aperture_scale: float = 2.5
     annulus_scale_inner: float = 1.7
     annulus_scale_outer: float = 2.4
     adaptive_photometry: bool = True
