@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pandas as pd
+from pathlib import Path
+
 import os
 import shutil
 import subprocess
@@ -322,6 +325,46 @@ def _resolve_target_xy_approx(
     print(f"[photometry] Target resolved with approximate pointing model: ({target_x:.1f}, {target_y:.1f})")
     return float(target_x), float(target_y)
 
+
+# Selecciona el frame de referencia con mejor calidad para fotometría.
+# Priorizamos bajo bad_pixel_fraction/saturation/background/std y señal suficiente.
+def select_best_qc_frame(aligned_dir: str | Path, qc_summary_path: str | Path | None = None) -> Path | None:
+    aligned_dir = Path(aligned_dir)
+    qc_path = Path(qc_summary_path) if qc_summary_path is not None else aligned_dir.parent / "reduced" / "qc_summary.csv"
+    if not qc_path.exists():
+        return None
+
+    df = pd.read_csv(qc_path)
+    if "file" not in df.columns or "quality_flag" not in df.columns:
+        return None
+
+    df_ok = df[df["quality_flag"].astype(str).str.lower() == "ok"].copy()
+    if df_ok.empty:
+        return None
+
+    score = np.zeros(len(df_ok), dtype=float)
+    weights = {
+        "bad_pixel_fraction": -0.45,
+        "saturation_fraction": -0.25,
+        "background_median": -0.15,
+        "std": -0.10,
+        "median": 0.05,
+    }
+    for column, weight in weights.items():
+        if column in df_ok.columns:
+            rank = pd.to_numeric(df_ok[column], errors="coerce").rank(method="average", pct=True)
+            rank = rank.fillna(0.5)
+            score += weight * rank.to_numpy(dtype=float)
+
+    df_ok = df_ok.assign(_reference_score=score).sort_values("_reference_score", ascending=False)
+    for fname in df_ok["file"].astype(str):
+        name = fname.strip()
+        if not name:
+            continue
+        fpath = aligned_dir / f"ali_cal_{name}"
+        if fpath.exists():
+            return fpath
+    return None
 
 def resolve_target_xy(
     reference_frame_path: str | Path,

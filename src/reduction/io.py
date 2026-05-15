@@ -16,7 +16,7 @@ SUPPORTED_SUFFIXES = {".fits", ".fit", ".fts", ".fz"}
 FRAME_ALIASES = {
     "bias": {"bias", "zero"},
     "dark": {"dark", "darks"},
-    "flat": {"flat", "flats", "field", "skyflat", "flatfield"},
+    "flat": {"flat", "flats", "field", "skyflat", "flatfield", "fff", "flat_frame"},
     "light": {"light", "object", "science", "target"},
 }
 DEFAULT_FILTER = "R"
@@ -51,10 +51,11 @@ def infer_frame_type(path: str | Path, header: fits.Header | None = None) -> str
     candidates.extend(path_tokens)
 
     for frame_type, aliases in FRAME_ALIASES.items():
-        if any(candidate in aliases for candidate in candidates):
+        # Buscar coincidencia exacta O si el alias está contenido en el candidate
+        if any(candidate in aliases or any(alias in candidate for alias in aliases) for candidate in candidates):
             return frame_type
 
-    return "unknown"
+    return "light" # Asumir que es un light si no se puede inferir
 
 
 def load_header(path: str | Path) -> fits.Header:

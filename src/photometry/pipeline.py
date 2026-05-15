@@ -21,7 +21,7 @@ from photometry.aperture import (  # noqa: E402
 )
 from photometry.differential import build_differential_light_curve  # noqa: E402
 from photometry.detrending import estimate_transit_mask, normalize_to_baseline  # noqa: E402
-from photometry.io import index_aligned_frames, resolve_target_xy  # noqa: E402
+from photometry.io import index_aligned_frames, resolve_target_xy, select_best_qc_frame  # noqa: E402
 from reduction.io import load_ccd  # noqa: E402
 
 
@@ -35,7 +35,7 @@ class PhotometryPaths:
 @dataclass(frozen=True)
 class PhotometryConfig:
     target_xy: tuple[float, float] | None = None
-    object_name: str = "WASP-2"  # used for SIMBAD lookup if target_xy is not provided
+    object_name: str = "HAT-P-14"  # used for SIMBAD lookup if target_xy is not provided
     pixel_scale_arcsec: float | None = None  # arcsec/px; optional if FITS has XPIXSZ/FOCALLEN
     prefer_wcs: bool = True
     wcs_solver: str = "auto"  # auto | none | local | online
@@ -208,6 +208,20 @@ def _build_reference_catalog(
         min_neighbor_distance=effective_min_neighbor_distance,
         brightness_range=config.comparison_brightness_range,
     )
+
+    if len(comparison_sources) < config.max_comparisons:
+        _print_comparison_selection_diagnostics(
+            sources=sources,
+            target_source=target_source,
+            image_shape=reference_ccd.data.shape,
+            min_separation=effective_min_sep,
+            min_edge_distance=config.min_edge_distance,
+            min_neighbor_distance=float(effective_min_neighbor_distance),
+            brightness_range=config.comparison_brightness_range,
+            n_selected=len(comparison_sources),
+            n_requested=config.max_comparisons,
+        )
+
     if not comparison_sources:
         raise ValueError("No suitable comparison stars were found in the reference frame.")
 
@@ -305,16 +319,131 @@ def _estimate_fwhm(
     return 2.355 * sigma
 
 
+def _comparison_rejection_reason(
+    source: dict[str, float],
+    source_list: list[dict[str, float]],
+    target_source: dict[str, float],
+    image_shape: tuple[int, int],
+    min_separation: float,
+    min_edge_distance: float,
+    min_neighbor_distance: float,
+    brightness_range: tuple[float, float],
+) -> tuple[str, float, float, float]:
+    height, width = image_shape
+    target_flux = max(float(target_source["flux"]), 1e-12)
+    brightness_min, brightness_max = brightness_range
+
+    if source is target_source:
+        return "target", float("nan"), float("nan"), float("nan")
+
+    if source["x"] < min_edge_distance or source["x"] > (width - min_edge_distance):
+        return "edge", float("nan"), float("nan"), float("nan")
+    if source["y"] < min_edge_distance or source["y"] > (height - min_edge_distance):
+        return "edge", float("nan"), float("nan"), float("nan")
+
+    distance_to_target = float(np.hypot(source["x"] - target_source["x"], source["y"] - target_source["y"]))
+    if distance_to_target < min_separation:
+        return "min_separation", distance_to_target, float("nan"), float("nan")
+
+    nearest_neighbor_distance = float("nan")
+    if min_neighbor_distance > 0.0:
+        nearest_neighbor_distance = min(
+            float(np.hypot(source["x"] - other["x"], source["y"] - other["y"]))
+            for other in source_list
+            if other is not source
+        )
+        if nearest_neighbor_distance < min_neighbor_distance:
+            return "min_neighbor_distance", distance_to_target, nearest_neighbor_distance, float("nan")
+
+    flux_ratio = max(float(source["flux"]), 1e-12) / target_flux
+    if flux_ratio < brightness_min or flux_ratio > brightness_max:
+        return "brightness_range", distance_to_target, nearest_neighbor_distance, flux_ratio
+
+    return "accepted", distance_to_target, nearest_neighbor_distance, flux_ratio
+
+
+def _print_comparison_selection_diagnostics(
+    sources: list[dict[str, float]],
+    target_source: dict[str, float],
+    image_shape: tuple[int, int],
+    min_separation: float,
+    min_edge_distance: float,
+    min_neighbor_distance: float,
+    brightness_range: tuple[float, float],
+    n_selected: int,
+    n_requested: int,
+) -> None:
+    counts = {
+        "target": 0,
+        "edge": 0,
+        "min_separation": 0,
+        "min_neighbor_distance": 0,
+        "brightness_range": 0,
+        "accepted": 0,
+    }
+    rejected_examples: list[tuple[str, dict[str, float], float, float, float]] = []
+
+    for source in sources:
+        reason, dist_target, dist_neighbor, flux_ratio = _comparison_rejection_reason(
+            source=source,
+            source_list=sources,
+            target_source=target_source,
+            image_shape=image_shape,
+            min_separation=min_separation,
+            min_edge_distance=min_edge_distance,
+            min_neighbor_distance=min_neighbor_distance,
+            brightness_range=brightness_range,
+        )
+        counts[reason] += 1
+        if reason not in {"target", "accepted"} and len(rejected_examples) < 8:
+            rejected_examples.append((reason, source, dist_target, dist_neighbor, flux_ratio))
+
+    print(
+        "[photometry] Comparators diagnostic: "
+        f"requested={n_requested}, selected={n_selected}, detected_sources={len(sources)}"
+    )
+    print(
+        "[photometry] Rejection summary: "
+        f"edge={counts['edge']}, "
+        f"min_sep={counts['min_separation']}, "
+        f"min_neighbor={counts['min_neighbor_distance']}, "
+        f"brightness={counts['brightness_range']}, "
+        f"accepted={counts['accepted']}"
+    )
+    print(
+        "[photometry] Thresholds: "
+        f"min_sep={min_separation:.2f} px, "
+        f"min_neighbor={min_neighbor_distance:.2f} px, "
+        f"brightness_range=({brightness_range[0]:.3f}, {brightness_range[1]:.3f})"
+    )
+    for idx, (reason, source, dist_target, dist_neighbor, flux_ratio) in enumerate(rejected_examples, start=1):
+        dt = "nan" if not np.isfinite(dist_target) else f"{dist_target:.2f}"
+        dn = "nan" if not np.isfinite(dist_neighbor) else f"{dist_neighbor:.2f}"
+        fr = "nan" if not np.isfinite(flux_ratio) else f"{flux_ratio:.3f}"
+        print(
+            f"[photometry] Rejected #{idx}: reason={reason}, x={source['x']:.1f}, y={source['y']:.1f}, "
+            f"dist_target={dt}, dist_neighbor={dn}, flux_ratio={fr}"
+        )
+
 def run_photometry_pipeline(
     paths: PhotometryPaths,
     config: PhotometryConfig | None = None,
 ) -> Table:
     config = config or PhotometryConfig()
 
+
     summary_path = paths.alignment_summary_path or (paths.aligned_dir / "alignment_summary.csv")
     frame_records = index_aligned_frames(paths.aligned_dir, summary_path=summary_path)
     if not frame_records:
         raise ValueError("No aligned frames were found for photometry.")
+
+    qc_path = Path(paths.aligned_dir).parent / "reduced" / "qc_summary.csv"
+    best_frame_path = select_best_qc_frame(paths.aligned_dir, qc_summary_path=qc_path)
+    # best_frame_path = frame_records[243].path
+    if best_frame_path is None:
+        best_frame_path = frame_records[0].path
+
+    print(f"[photometry] Using reference frame: {best_frame_path.name}")
 
     paths.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -323,7 +452,7 @@ def run_photometry_pipeline(
     if resolved_target_xy is None and config.object_name:
         try:
             resolved_target_xy = resolve_target_xy(
-                reference_frame_path=frame_records[0].path,
+                reference_frame_path=best_frame_path,
                 object_name=config.object_name,
                 pixel_scale_arcsec=config.pixel_scale_arcsec,
                 prefer_wcs=config.prefer_wcs,
@@ -343,7 +472,7 @@ def run_photometry_pipeline(
         config = dataclasses.replace(config, target_xy=resolved_target_xy)
 
     # First pass: build catalog with default separation to compute annulus radii
-    _, target_source, comparison_sources = _build_reference_catalog(frame_records[0].path, config)
+    _, target_source, comparison_sources = _build_reference_catalog(best_frame_path, config)
     aperture_radius, annulus_r_in, annulus_r_out = _resolve_aperture_radii(
         target_source,
         config,
@@ -354,7 +483,7 @@ def run_photometry_pipeline(
     if effective_min_sep > config.min_source_separation:
         print(f"[photometry] Enforcing min_separation={effective_min_sep:.1f} px (ann_r_out={annulus_r_out:.1f} px)")
         _, target_source, comparison_sources = _build_reference_catalog(
-            frame_records[0].path, config, min_separation_override=effective_min_sep
+            best_frame_path, config, min_separation_override=effective_min_sep
         )
         aperture_radius, annulus_r_in, annulus_r_out = _resolve_aperture_radii(
             target_source, config

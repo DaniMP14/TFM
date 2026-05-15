@@ -19,6 +19,7 @@ from reduction.qc import compute_qc_metrics
 class ReductionPaths:
     raw_dir: Path
     output_dir: Path
+    background_median_max: float = 70.0
 
 
 def run_reduction_pipeline(paths: ReductionPaths) -> Table:
@@ -77,7 +78,10 @@ def run_reduction_pipeline(paths: ReductionPaths) -> Table:
         output_path = calibrated_dir / f"cal_{light_record.path.name}"
         calibrated.write(output_path, overwrite=True)
 
-        qc_result = compute_qc_metrics(calibrated)
+        qc_result = compute_qc_metrics(
+            calibrated,
+            high_background_threshold=paths.background_median_max,
+        )
         row = {
             "file": light_record.path.name,
             "filter": filter_key,

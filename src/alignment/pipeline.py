@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from astropy.table import Table
 
 # Ensure src/ is on sys.path so sibling packages (reduction, alignment) resolve
@@ -28,7 +29,7 @@ class AlignmentPaths:
 class AlignmentConfig:
     max_shift: int = 100  # maximum pixel shift to search in each direction
     interpolation_order: int = 3  # cubic interpolation
-    reference_strategy: str = "first"  # "first" or "median"
+    reference_strategy: str = "median"  # "first" or "median"
     shift_mode: str = "previous"  # "previous" (incremental) or "global"
     include_reference_in_output: bool = True
     two_pass: bool = True
@@ -40,6 +41,13 @@ class AlignmentConfig:
 def _discover_calibrated_files(calibrated_dir: Path) -> list[Path]:
     paths = sorted(calibrated_dir.glob("*.fit")) + sorted(calibrated_dir.glob("*.fits")) + sorted(calibrated_dir.glob("*.fts")) + sorted(calibrated_dir.glob("*.fz"))
     return sorted(set(paths))
+
+
+def _load_qc_summary(calibrated_dir: Path) -> pd.DataFrame | None:
+    qc_path = calibrated_dir.parent / "qc_summary.csv"
+    if not qc_path.exists():
+        return None
+    return pd.read_csv(qc_path)
 
 
 def _resolve_aligned_dir(output_dir: Path) -> Path:
@@ -213,6 +221,14 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
     files = _discover_calibrated_files(paths.calibrated_dir)
     if not files:
         raise ValueError("No calibrated frames were found for alignment.")
+
+    qc_summary = _load_qc_summary(paths.calibrated_dir)
+    if qc_summary is not None and "file" in qc_summary.columns and "quality_flag" in qc_summary.columns:
+        allowed_files = set(qc_summary.loc[qc_summary["quality_flag"] == "ok", "file"].astype(str))
+        files = [path for path in files if path.name.removeprefix("cal_") in allowed_files]
+
+    if not files:
+        raise ValueError("No calibrated frames remained after QC screening.")
 
     paths.output_dir.mkdir(parents=True, exist_ok=True)
     aligned_dir = _resolve_aligned_dir(paths.output_dir)
