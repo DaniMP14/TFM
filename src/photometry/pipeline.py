@@ -85,7 +85,6 @@ def _compute_rms_oot(
     transit_mask = estimate_transit_mask(
         lc_norm,
         normalized_flux_column="normalized_flux",
-        threshold_sigma=transit_threshold_sigma,
     )
     oot_mask = ~np.asarray(transit_mask, dtype=bool)
     if int(np.sum(oot_mask)) < 3:
@@ -100,7 +99,6 @@ def _remove_oot_outliers(
     sigma_threshold: float,
     upper_only: bool,
     baseline_percentile_range: tuple[float, float],
-    transit_threshold_sigma: float,
 ) -> tuple[pd.DataFrame, int]:
     if light_curve_df.empty:
         return light_curve_df.copy(), 0
@@ -117,7 +115,6 @@ def _remove_oot_outliers(
     transit_mask = estimate_transit_mask(
         lc_norm,
         normalized_flux_column="normalized_flux",
-        threshold_sigma=transit_threshold_sigma,
     )
     oot_mask = ~np.asarray(transit_mask, dtype=bool)
     if int(np.sum(oot_mask)) < 8:
@@ -597,7 +594,6 @@ def run_photometry_pipeline(
             sigma_threshold=config.oot_outlier_sigma,
             upper_only=config.oot_outlier_upper_only,
             baseline_percentile_range=config.oot_baseline_percentile_range,
-            transit_threshold_sigma=config.oot_transit_threshold_sigma,
         )
 
     rms_oot_after = _compute_rms_oot(

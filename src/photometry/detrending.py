@@ -248,220 +248,105 @@ def detrend_with_auxilliary(
     return result
 
 
-def estimate_transit_mask( #TODO: hace transitos tardios, mejorar detección de ingreso/egreso (actualmente depende de umbral fijo, no data-driven)
+def estimate_transit_mask(
     light_curve: pd.DataFrame,
     normalized_flux_column: str = "normalized_flux",
-    threshold_sigma: float = 2.0,
-    window_buffer_points: int = 0,
-    time_column: str | None = None,
-    expected_mid_time: float | None = None,
-    expected_duration: float | None = None,
-    prior_half_window_factor: float = 1.5,
-    min_prior_overlap_fraction: float = 0.2,
-    edge_level_frac: float | None = None,
-    edge_sigma_factor: float | None = None,
-    edge_smoothing_points: int = 7,
-    right_trim_quantile: float | None = None,
+    window_buffer_points: int = 5,
     min_transit_points: int = 5,
 ) -> np.ndarray:
     """
-    Estima una máscara de tránsito de forma robusta combinando:
-    1) detección fotométrica por umbral robusto (MAD),
-    2) expansión temporal opcional,
-    3) (opcional) refinado por bordes de baja profundidad,
-    4) (opcional) prior temporal suave para usar efemérides sin colapsar casos con O-C grande.
-
-    Por defecto, el comportamiento es compatible con la versión previa.
+     Estima una máscara de tránsito basada en cruces al 10% de profundidad:
+     1) Suavizado robusto de la curva normalizada.
+     2) Cruce izquierdo/derecho del nivel 10%.
+     3) Máscara final = [cruce_izq_10%, cruce_der_10%] +/- buffer (en puntos).
 
     Args:
         light_curve: DataFrame con curva normalizada.
         normalized_flux_column: columna con flujo normalizado.
-        threshold_sigma: número de MADs por debajo de la mediana para el núcleo.
-        window_buffer_points: número de puntos extra a enmascarar a cada lado
-            del segmento detectado (0 = sin expansión).
-        time_column: columna temporal (necesaria para usar prior temporal).
-        expected_mid_time: instante esperado del centro de tránsito (misma unidad que time_column).
-        expected_duration: duración esperada total del tránsito (misma unidad que time_column).
-        prior_half_window_factor: factor multiplicativo del semiancho esperado para construir
-            la ventana prior temporal: half_window = factor * expected_duration / 2.
-        min_prior_overlap_fraction: fracción mínima de solape entre máscara detectada y prior
-            para activar la fusión suave con efemérides.
-        edge_level_frac: si se define (ej. 0.02-0.05), refina bordes con un nivel de baja
-            profundidad relativo al OOT para capturar mejor ingreso/egreso.
-        edge_sigma_factor: alternativa data-driven a edge_level_frac. Si se define
-            (ej. 0.8-1.5), usa un nivel de borde basado en dispersión OOT:
-            edge_level = OOT - edge_sigma_factor * sigma_OOT.
-            Esto evita adelantar/atrasar bordes "a mano".
-        edge_smoothing_points: ventana (impar) para suavizar flujo al detectar cruces
-            de borde. Reduce sensibilidad a ruido puntual.
-        right_trim_quantile: si se define (ej. 0.8-0.9), recorta la cola derecha de la máscara
-            al cuantil indicado para evitar egresos artificialmente tardíos.
+        window_buffer_points: número de puntos extra por lado (simétrico).
+            Se usa tal cual (si es negativo, se fuerza a 0).
+        time_column: columna temporal (opcional, para prior temporal).
+        expected_mid_time: instante esperado del centro de tránsito (opcional).
+        expected_duration: duración esperada total del tránsito (opcional).
         min_transit_points: número mínimo de puntos para aceptar una máscara refinada.
 
     Returns:
         Array booleano con True en puntos de tránsito.
     """
     flux = light_curve[normalized_flux_column].to_numpy(dtype=float)
+    n_points = len(flux)
     finite_flux = np.isfinite(flux)
-    if int(np.sum(finite_flux)) < max(min_transit_points, 3):
-        return np.zeros(len(flux), dtype=bool)
+    if np.sum(finite_flux) < max(min_transit_points, 3):
+        return np.zeros(n_points, dtype=bool)
 
+    # Serie suavizada para estimar cruces de nivel de profundidad.
+    flux_filled = flux.copy()
     flux_valid = flux[finite_flux]
-    median_flux = float(np.median(flux_valid))
-    mad = float(np.median(np.abs(flux_valid - median_flux)))
+    median_flux = np.median(flux_valid)
+    flux_filled[~finite_flux] = median_flux
+    smooth_window = max(7, (n_points // 25) | 1)
+    flux_smooth = pd.Series(flux_filled).rolling(
+        smooth_window,
+        center=True,
+        min_periods=1,
+    ).median().to_numpy()
 
-    if not np.isfinite(mad) or mad == 0.0:
-        mad = float(np.std(flux_valid))
+    i_min = int(np.argmin(flux_smooth))
+    x = np.arange(n_points, dtype=float)
+    # Si existe una máscara previa, usar su OOT para el nivel base mejora la
+    # estabilidad frente a pendientes largas del baseline.
+    if "in_transit_mask" in light_curve.columns:
+        prev_mask = light_curve["in_transit_mask"].astype(bool).to_numpy()
+    else:
+        prev_mask = np.zeros(n_points, dtype=bool)
 
-    if not np.isfinite(mad) or mad <= 0.0:
-        return np.zeros(len(flux), dtype=bool)
+    if prev_mask.any() and (~prev_mask).sum() >= max(20, n_points // 5):
+        oot_level = float(np.median(flux[~prev_mask]))
+    else:
+        oot_level = float(np.percentile(flux_smooth[finite_flux], 75))
 
-    # Núcleo del tránsito: puntos significativamente por debajo de la mediana
-    transit_mask = flux < (median_flux - threshold_sigma * mad)
+    depth = float(max(oot_level - np.min(flux_smooth[finite_flux]), 0.0))
+
+    buffer_pts = max(0, int(window_buffer_points))
+
+    def _interp_cross(x1: float, y1: float, x2: float, y2: float, level: float) -> float:
+        if y2 == y1:
+            return float(x1)
+        frac = (level - y1) / (y2 - y1)
+        frac = float(np.clip(frac, 0.0, 1.0))
+        return float(x1 + frac * (x2 - x1))
+
+    if depth <= 0.0:
+        return np.zeros(n_points, dtype=bool)
+
+    level_10 = oot_level - 0.10 * depth
+
+    left_10_x = None
+    for i in range(i_min - 1, -1, -1):
+        if flux_smooth[i] > level_10 and flux_smooth[i + 1] <= level_10:
+            left_10_x = _interp_cross(x[i], flux_smooth[i], x[i + 1], flux_smooth[i + 1], level_10)
+            break
+
+    right_10_x = None
+    for i in range(i_min, n_points - 1):
+        if flux_smooth[i] <= level_10 and flux_smooth[i + 1] > level_10:
+            right_10_x = _interp_cross(x[i], flux_smooth[i], x[i + 1], flux_smooth[i + 1], level_10)
+            break
+
+    if left_10_x is None or right_10_x is None:
+        return np.zeros(n_points, dtype=bool)
+
+    i_start = max(0, int(np.floor(left_10_x)) - buffer_pts)
+    i_end = min(n_points - 1, int(np.ceil(right_10_x)) + buffer_pts)
+
+    if i_end < i_start:
+        return np.zeros(n_points, dtype=bool)
+
+    transit_mask = np.zeros(n_points, dtype=bool)
+    transit_mask[i_start : i_end + 1] = True
     transit_mask &= finite_flux
 
-    # Expansión temporal: si hay puntos detectados, ampliar la ventana
-    if window_buffer_points > 0 and transit_mask.any():
-        indices = np.where(transit_mask)[0]
-        i_first = max(0, indices[0] - window_buffer_points)
-        i_last = min(len(flux) - 1, indices[-1] + window_buffer_points)
-        transit_mask[i_first : i_last + 1] = True
-
-    # Ajuste adicional para garantizar ingreso/egreso
-    if transit_mask.any():
-        idx = np.where(transit_mask)[0]
-        i_start, i_end = idx[0], idx[-1]
-
-        # Expandir bordes si no están bien definidos
-        if i_start > 0:
-            transit_mask[:i_start] = flux[:i_start] < (median_flux - threshold_sigma * mad)
-        if i_end < len(flux) - 1:
-            transit_mask[i_end + 1 :] = flux[i_end + 1 :] < (median_flux - threshold_sigma * mad)
-
-        # Revalidar bordes tras expansión
-        idx = np.where(transit_mask)[0]
-        if len(idx) > 0:
-            i_start, i_end = idx[0], idx[-1]
-            transit_mask[i_start : i_end + 1] = True
-
-    # Refinado opcional de bordes (captura mejor ingreso/egreso):
-    # - por fracción de profundidad (edge_level_frac), o
-    # - de forma data-driven con ruido OOT (edge_sigma_factor).
-    if transit_mask.any() and (
-        (edge_level_frac is not None and edge_level_frac > 0.0)
-        or (edge_sigma_factor is not None and edge_sigma_factor > 0.0)
-    ):
-        idx = np.where(transit_mask)[0]
-        i_start_base = int(idx[0])
-        i_end_base = int(idx[-1])
-
-        if int(np.sum(~transit_mask & finite_flux)) >= 10:
-            oot_level = float(np.median(flux[(~transit_mask) & finite_flux]))
-        else:
-            oot_level = float(np.percentile(flux_valid, 75.0))
-
-        depth = float(max(oot_level - np.min(flux_valid), 0.0))
-
-        oot_flux_vals = flux[(~transit_mask) & finite_flux]
-        sigma_oot = np.nan
-        if oot_flux_vals.size >= 8:
-            oot_med = float(np.median(oot_flux_vals))
-            oot_mad = float(np.median(np.abs(oot_flux_vals - oot_med)))
-            if np.isfinite(oot_mad) and oot_mad > 0.0:
-                sigma_oot = 1.4826 * oot_mad
-            if not np.isfinite(sigma_oot) or sigma_oot <= 0.0:
-                sigma_oot = float(np.std(oot_flux_vals))
-
-        edge_level = np.nan
-        if edge_sigma_factor is not None and np.isfinite(sigma_oot) and sigma_oot > 0.0:
-            edge_level = oot_level - float(edge_sigma_factor) * sigma_oot
-        elif edge_level_frac is not None and np.isfinite(depth) and depth > 0.0:
-            edge_level = oot_level - float(edge_level_frac) * depth
-
-        if np.isfinite(edge_level):
-            smooth_window = max(1, int(edge_smoothing_points))
-            if smooth_window % 2 == 0:
-                smooth_window += 1
-            flux_edge = pd.Series(flux).rolling(
-                window=smooth_window,
-                center=True,
-                min_periods=1,
-            ).median().to_numpy(dtype=float)
-
-            i_min = int(np.argmin(np.where(finite_flux, flux_edge, np.inf)))
-
-            i_left_edge = None
-            for i in range(i_min - 1, -1, -1):
-                if (
-                    finite_flux[i]
-                    and finite_flux[i + 1]
-                    and flux_edge[i] > edge_level
-                    and flux_edge[i + 1] <= edge_level
-                ):
-                    i_left_edge = i
-                    break
-
-            i_right_edge = None
-            for i in range(i_min, len(flux) - 1):
-                if (
-                    finite_flux[i]
-                    and finite_flux[i + 1]
-                    and flux_edge[i] <= edge_level
-                    and flux_edge[i + 1] > edge_level
-                ):
-                    i_right_edge = i + 1
-                    break
-
-            i_start = min(i_start_base, i_left_edge if i_left_edge is not None else i_start_base)
-            i_end = i_end_base if i_right_edge is None else min(i_end_base, i_right_edge)
-
-            # Recorte opcional del ala derecha (útil cuando el egreso queda sistemáticamente tardío).
-            if right_trim_quantile is not None and 0.0 < right_trim_quantile < 1.0:
-                i_right_q = int(np.quantile(idx, right_trim_quantile))
-                i_end = min(i_end, i_right_q)
-
-            if i_end > i_start and (i_end - i_start + 1) >= min_transit_points:
-                refined = np.zeros_like(transit_mask, dtype=bool)
-                refined[i_start : i_end + 1] = True
-                refined &= finite_flux
-                transit_mask = refined
-
-    # Prior temporal suave (NO duro):
-    # - Si hay buena detección y solape razonable con prior, fusiona para estabilizar bordes.
-    # - Si el solape es pobre (potencial O-C grande), conserva la máscara data-driven.
-    # - Si no hay detección y existe prior válido, usa prior como fallback.
-    prior_mask = None
-    if (
-        time_column is not None
-        and expected_mid_time is not None
-        and expected_duration is not None
-        and expected_duration > 0.0
-        and time_column in light_curve.columns
-    ):
-        t = light_curve[time_column].to_numpy(dtype=float)
-        finite_t = np.isfinite(t)
-        half_window = float(prior_half_window_factor) * float(expected_duration) / 2.0
-        if np.isfinite(half_window) and half_window > 0.0:
-            t_start = float(expected_mid_time) - half_window
-            t_end = float(expected_mid_time) + half_window
-            prior_mask = (t >= t_start) & (t <= t_end) & finite_t & finite_flux
-
-    if prior_mask is not None and int(np.sum(prior_mask)) >= min_transit_points:
-        if transit_mask.any():
-            overlap = float(np.sum(transit_mask & prior_mask)) / float(np.sum(transit_mask))
-            if overlap >= float(min_prior_overlap_fraction):
-                fused = transit_mask | prior_mask
-                idx_f = np.where(fused)[0]
-                i0, i1 = int(idx_f[0]), int(idx_f[-1])
-                fused_contiguous = np.zeros_like(transit_mask, dtype=bool)
-                fused_contiguous[i0 : i1 + 1] = True
-                fused_contiguous &= finite_flux
-                if int(np.sum(fused_contiguous)) >= min_transit_points:
-                    transit_mask = fused_contiguous
-        else:
-            transit_mask = prior_mask.copy()
-
-    if int(np.sum(transit_mask)) < min_transit_points:
-        return np.zeros(len(flux), dtype=bool)
+    if np.sum(transit_mask) < min_transit_points:
+        return np.zeros(n_points, dtype=bool)
 
     return transit_mask
