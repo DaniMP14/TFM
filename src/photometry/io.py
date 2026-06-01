@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import pandas as pd
-from pathlib import Path
-
 import os
 import shutil
 import subprocess
@@ -20,6 +17,16 @@ from astropy.wcs import WCS
 from astropy.wcs import FITSFixedWarning
 
 from reduction.io import get_exposure_time
+
+
+POINTING_COORD_KEY_PAIRS: tuple[tuple[str, str], ...] = (
+    ("OBJCTRA", "OBJCTDEC"),
+    ("OBJRA", "OBJDEC"),
+    ("OBJ-RA", "OBJ-DEC"),
+    ("TELRA", "TELDEC"),
+    ("RA", "DEC"),
+    ("CRVAL1", "CRVAL2"),
+)
 
 
 @dataclass(frozen=True)
@@ -114,6 +121,52 @@ def _parse_sexagesimal_coord(ra_str: str, dec_str: str) -> tuple[float, float]:
     """Parse OBJCTRA/OBJCTDEC strings (e.g. '20 14 00', '+65 13 54') to degrees."""
     coord = SkyCoord(ra=ra_str, dec=dec_str, unit=("hourangle", "deg"))
     return float(coord.ra.deg), float(coord.dec.deg)
+
+
+def _get_header_coord_values(
+    header: fits.Header,
+) -> tuple[str, str, str, str] | None:
+    for ra_key, dec_key in POINTING_COORD_KEY_PAIRS:
+        ra_value = header.get(ra_key)
+        dec_value = header.get(dec_key)
+        if ra_value is None or dec_value is None:
+            continue
+
+        ra_text = str(ra_value).strip()
+        dec_text = str(dec_value).strip()
+        if not ra_text or not dec_text:
+            continue
+
+        return ra_key, dec_key, ra_text, dec_text
+
+    return None
+
+
+def _parse_pointing_coord(ra_key: str, dec_key: str, ra_text: str, dec_text: str) -> tuple[float, float]:
+    # First try hour-angle parsing for canonical RA/DEC header names used by many instruments.
+    try:
+        ra_deg, dec_deg = _parse_sexagesimal_coord(ra_text, dec_text)
+        return ra_deg, dec_deg
+    except Exception:
+        pass
+
+    try:
+        ra_num = float(ra_text)
+        dec_num = float(dec_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Could not parse pointing coordinates from header keys {ra_key}/{dec_key}: "
+            f"RA='{ra_text}', DEC='{dec_text}'."
+        ) from exc
+
+    key_upper = ra_key.upper()
+    if key_upper.startswith("CRVAL"):
+        return float(ra_num), float(dec_num)
+
+    # For non-CRVAL numeric headers, assume the pair is already expressed in degrees.
+    # This avoids silently misinterpreting a numeric RA as hours when the instrument
+    # actually stores degrees in a compact form.
+    return float(ra_num), float(dec_num)
 
 
 def _header_to_celestial_wcs(header: fits.Header) -> WCS | None:
@@ -293,13 +346,16 @@ def _resolve_target_xy_approx(
     header: fits.Header,
     pixel_scale_arcsec: float | None,
 ) -> tuple[float, float]:
-    objctra = header.get("OBJCTRA")  # TODO: regex con mas claves posibles (OBJRA, OBJ-RA, etc)
-    objctdec = header.get("OBJCTDEC")
-    if objctra is None or objctdec is None:
+    coord_values = _get_header_coord_values(header)
+    if coord_values is None:
+        pairs = ", ".join([f"{ra}/{dec}" for ra, dec in POINTING_COORD_KEY_PAIRS])
         raise ValueError(
-            "FITS header is missing OBJCTRA / OBJCTDEC pointing coordinates. "
+            "FITS header is missing pointing RA/DEC keywords. "
+            f"Tried: {pairs}. "
             "Provide target_xy manually in PhotometryConfig."
         )
+
+    ra_key, dec_key, ra_text, dec_text = coord_values
 
     if pixel_scale_arcsec is None:
         pixel_scale_arcsec = estimate_pixel_scale_arcsec(header)
@@ -309,7 +365,7 @@ def _resolve_target_xy_approx(
             "Provide pixel_scale_arcsec in PhotometryConfig."
         )
 
-    center_ra_deg, center_dec_deg = _parse_sexagesimal_coord(str(objctra).strip(), str(objctdec).strip())
+    center_ra_deg, center_dec_deg = _parse_pointing_coord(ra_key, dec_key, ra_text, dec_text)
     center_coord = SkyCoord(ra=center_ra_deg, dec=center_dec_deg, unit="deg")
 
     delta_ra_arcsec = float((target_coord.ra.deg - center_coord.ra.deg) * np.cos(np.radians(center_coord.dec.deg)) * 3600.0)
@@ -322,7 +378,10 @@ def _resolve_target_xy_approx(
 
     target_x = center_x - delta_ra_arcsec / float(pixel_scale_arcsec)
     target_y = center_y + delta_dec_arcsec / float(pixel_scale_arcsec)
-    print(f"[photometry] Target resolved with approximate pointing model: ({target_x:.1f}, {target_y:.1f})")
+    print(
+        "[photometry] Target resolved with approximate pointing model "
+        f"using {ra_key}/{dec_key}: ({target_x:.1f}, {target_y:.1f})"
+    )
     return float(target_x), float(target_y)
 
 

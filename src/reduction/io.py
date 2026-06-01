@@ -75,10 +75,14 @@ def load_ccd(path: str | Path, unit: str = "adu") -> CCDData:
         warnings.simplefilter("ignore", FITSFixedWarning)
         with fits.open(path) as hdul:
             hdu_index = next((i for i, hdu in enumerate(hdul) if getattr(hdu, "data", None) is not None), 0)
+            hdu_header = hdul[hdu_index].header
+            header_bunit = hdu_header.get("BUNIT")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FITSFixedWarning)
-            return CCDData.read(path, unit=unit, hdu=hdu_index)
+            if header_bunit in (None, ""):
+                return CCDData.read(path, unit=unit, hdu=hdu_index)
+            return CCDData.read(path, hdu=hdu_index)
     finally:
         ccd_logger.setLevel(previous_level)
 

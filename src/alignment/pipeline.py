@@ -33,10 +33,12 @@ class AlignmentConfig:
     shift_mode: str = "previous"  # "previous" (incremental) or "global"
     include_reference_in_output: bool = True
     two_pass: bool = True
-    corr_hard_threshold: float = 0.4
-    corr_soft_threshold: float = 0.7
+    corr_hard_threshold: float = 0.12
+    corr_soft_threshold: float = 0.18
     jump_threshold: float = 5.0
-
+    corr_drop_fraction: float = 0.45
+    corr_drop_min_baseline: float = 0.35
+    corr_drop_window: int = 10
 
 def _discover_calibrated_files(calibrated_dir: Path) -> list[Path]:
     paths = sorted(calibrated_dir.glob("*.fit")) + sorted(calibrated_dir.glob("*.fits")) + sorted(calibrated_dir.glob("*.fts")) + sorted(calibrated_dir.glob("*.fz"))
@@ -109,7 +111,11 @@ def _estimate_shifts(
         shift_error = False
         shift_error_msg = ""
 
-        if index == 0 and config.reference_strategy == "first":
+        # In incremental mode, the first frame defines the zero point.
+        # This avoids injecting a large initial offset when using a median reference.
+        if index == 0 and config.shift_mode == "previous":
+            dx, dy, peak_value = 0.0, 0.0, 1.0
+        elif index == 0 and config.reference_strategy == "first":
             dx, dy, peak_value = 0.0, 0.0, 1.0
         else:
             try:
@@ -123,6 +129,14 @@ def _estimate_shifts(
                     moving=current_data,
                     max_shift=config.max_shift,
                 )
+
+                if shift.peak_value < config.corr_hard_threshold:
+                    # Low-correlation warnings should not invalidate the shift estimate
+                    # here, otherwise the incremental chain can collapse for all following frames.
+                    shift_error_msg = (
+                        f"Correlation too low ({shift.peak_value:.6f}) for frame {file_path.name}."
+                    )
+                    print(shift_error_msg)
 
                 if config.shift_mode == "previous":
                     cumulative_dx += float(shift.dx)
@@ -139,7 +153,8 @@ def _estimate_shifts(
                 shift_error_msg = str(exc)
                 print(f"Warning: shift estimation failed for '{file_path.name}': {exc}")
 
-        previous_data = current_data
+        if not shift_error:
+            previous_data = current_data
 
         estimates.append(
             {
@@ -167,11 +182,29 @@ def _detect_bad_indices(
     corr_hard_threshold: float,
     corr_soft_threshold: float,
     jump_threshold: float,
-) -> tuple[set[int], np.ndarray, np.ndarray, float]:
+    corr_drop_fraction: float,
+    corr_drop_min_baseline: float,
+    corr_drop_window: int,
+) -> tuple[set[int], np.ndarray, np.ndarray, np.ndarray, float]:
     corr = np.array([float(item["corr_peak"]) for item in estimates], dtype=float)
     jumps = _compute_jumps(estimates)
 
     low_corr = corr < corr_soft_threshold
+
+    corr_drop = np.zeros(len(estimates), dtype=bool)
+
+    # Detect sudden relative drops versus recent baseline.
+    # This avoids punishing entire nights with uniformly low correlation.
+    min_history = 3
+    for i in range(len(estimates)):
+        start = max(0, i - max(1, int(corr_drop_window)))
+        history = corr[start:i]
+        if history.size < min_history:
+            continue
+        baseline = float(np.median(history))
+        drop_limit = baseline * (1.0 - float(corr_drop_fraction))
+        if baseline >= corr_drop_min_baseline and corr[i] < drop_limit:
+            corr_drop[i] = True
 
     # Always reject frames where shift estimation itself failed.
     bad_indices: set[int] = {
@@ -188,7 +221,12 @@ def _detect_bad_indices(
         if corr[i] < corr_soft_threshold and jumps[i] > jump_threshold:
             bad_indices.add(i)
 
-    return bad_indices, jumps, low_corr, corr_soft_threshold
+    # Reject abrupt quality collapses from a previously good baseline.
+    for i in range(len(estimates)):
+        if corr_drop[i]:
+            bad_indices.add(i)
+
+    return bad_indices, jumps, low_corr, corr_drop, corr_soft_threshold
 
 
 def _write_aligned_frames(
@@ -219,6 +257,7 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
     config = config or AlignmentConfig()
 
     files = _discover_calibrated_files(paths.calibrated_dir)
+    all_files = list(files)
     if not files:
         raise ValueError("No calibrated frames were found for alignment.")
 
@@ -226,6 +265,15 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
     if qc_summary is not None and "file" in qc_summary.columns and "quality_flag" in qc_summary.columns:
         allowed_files = set(qc_summary.loc[qc_summary["quality_flag"] == "ok", "file"].astype(str))
         files = [path for path in files if path.name.removeprefix("cal_") in allowed_files]
+
+        # Temporary safety valve: if QC excludes everything, continue with all frames.
+        # Useful for nights where all frames carry the same conservative reject label.
+        if not files:
+            print(
+                "Warning: QC filter produced 0 frames (no quality_flag='ok'). "
+                "Temporarily falling back to all calibrated frames for alignment."
+            )
+            files = all_files
 
     if not files:
         raise ValueError("No calibrated frames remained after QC screening.")
@@ -240,14 +288,18 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
     bad_indices: set[int] = set()
     pass1_jumps = _compute_jumps(pass1_estimates)
     pass1_low_corr = np.zeros(len(files), dtype=bool)
+    pass1_corr_drop = np.zeros(len(files), dtype=bool)
     corr_threshold = float("nan")
 
     if config.two_pass:
-        bad_indices, pass1_jumps, pass1_low_corr, corr_threshold = _detect_bad_indices(
+        bad_indices, pass1_jumps, pass1_low_corr, pass1_corr_drop, corr_threshold = _detect_bad_indices(
             pass1_estimates,
             corr_hard_threshold=config.corr_hard_threshold,
             corr_soft_threshold=config.corr_soft_threshold,
             jump_threshold=config.jump_threshold,
+            corr_drop_fraction=config.corr_drop_fraction,
+            corr_drop_min_baseline=config.corr_drop_min_baseline,
+            corr_drop_window=config.corr_drop_window,
         )
 
     kept_files = [file_path for i, file_path in enumerate(files) if i not in bad_indices]
@@ -292,6 +344,7 @@ def run_alignment_pipeline(paths: AlignmentPaths, config: AlignmentConfig | None
                 "status": status,
                 "pass1_jump": float(pass1_jumps[i]),
                 "pass1_low_corr": bool(pass1_low_corr[i]),
+                "pass1_corr_drop": bool(pass1_corr_drop[i]),
                 "rejected": bool(was_rejected),
                 "corr_threshold": corr_threshold,
                 "pass1_shift_error": bool(pass1_item.get("shift_error", False)),
