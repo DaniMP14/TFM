@@ -24,6 +24,7 @@ dependencies:
   
   # Machine Learning
   - scikit-learn>=1.3
+  - xgboost>=1.7
   
   # Estadística bayesiana
   - emcee>=3.1

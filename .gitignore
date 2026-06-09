@@ -15,3 +15,10 @@ __pycache__/
 *.fit
 *.fts
 *.fz
+
+# Clasificador ML (artefactos y datasets grandes)
+src/classifier/artifacts/*
+src/classifier/data/training/raw/*
+src/classifier/data/training/processed/*
+src/classifier/data/test/processed/*
+src/classifier/data/test/raw/*
