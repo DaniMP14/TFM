@@ -29,6 +29,7 @@ dependencies:
   # Estadística bayesiana
   - emcee>=3.1
   - corner>=2.2
+  - ellc
   
   # Desarrollo
   - jupyter>=1.0
@@ -44,5 +45,6 @@ dependencies:
   - pip:
     - batman-package>=2.4.9
     - pytransit>=2.6
-    - allesfitter>=1.2
+    - george
     - dynesty>=2.1
+    - allesfitter==1.2.10
