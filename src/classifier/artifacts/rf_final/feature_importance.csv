@@ -1,0 +1,14 @@
+feature,importance
+slope_linear,0.12630074876150094
+depth_to_mad_ratio,0.11260630452992983
+min_time_offset,0.10273439133576441
+transit_depth_snr,0.09916630863302481
+transit_depth_est,0.08839380652605566
+skewness_flux,0.08488662977810292
+binning_std_ratio,0.06765551633012576
+p2p_to_std_ratio,0.06590621816936218
+autocorr_lag1,0.059931798127485836
+kurtosis_flux,0.05669438083931978
+local_global_std_ratio,0.051451370220351414
+ingress_egress_balance,0.047847506591727304
+in_transit_fraction_est,0.03642502015724916

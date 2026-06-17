@@ -19,7 +19,7 @@ from reduction.qc import compute_qc_metrics
 class ReductionPaths:
     raw_dir: Path
     output_dir: Path
-    background_median_max: float = 70.0
+    background_median_max: float = 100.0
 
 
 def run_reduction_pipeline(paths: ReductionPaths) -> Table:

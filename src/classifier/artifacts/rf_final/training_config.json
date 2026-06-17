@@ -1,0 +1,23 @@
+{
+  "model_type": "rf",
+  "test_size": 0.25,
+  "random_state": 42,
+  "n_estimators": 200,
+  "max_depth": null,
+  "min_samples_split": 5,
+  "min_samples_leaf": 2,
+  "class_weight": {
+    "0": 1.0,
+    "1": 1.0
+  },
+  "svm_c": 1.0,
+  "svm_kernel": "rbf",
+  "svm_gamma": "scale",
+  "xgb_n_estimators": 600,
+  "xgb_max_depth": 6,
+  "xgb_learning_rate": 0.03,
+  "xgb_subsample": 0.8,
+  "xgb_colsample_bytree": 0.7,
+  "xgb_min_child_weight": 3,
+  "xgb_reg_lambda": 3.0
+}

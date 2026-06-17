@@ -17,7 +17,8 @@ __pycache__/
 *.fz
 
 # Clasificador ML (artefactos y datasets grandes)
-src/classifier/artifacts/*
+src/classifier/artifacts/svm_final/*
+src/classifier/artifacts/xgb_final/*
 src/classifier/data/training/raw/*
 src/classifier/data/training/processed/*
 src/classifier/data/test/processed/*

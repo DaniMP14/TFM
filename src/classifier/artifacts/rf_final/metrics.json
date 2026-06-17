@@ -1,0 +1,30 @@
+{
+  "n_train": 19971,
+  "n_test": 6657,
+  "accuracy": 0.9092684392368935,
+  "precision": 0.8961605584642234,
+  "recall": 0.92578125,
+  "f1": 0.9107301211942064,
+  "roc_auc": 0.9710548743414517,
+  "class_distribution_train": [
+    9985,
+    9986
+  ],
+  "class_distribution_test": [
+    3329,
+    3328
+  ],
+  "confusion_matrix": [
+    [
+      2972,
+      357
+    ],
+    [
+      247,
+      3081
+    ]
+  ],
+  "model_type": "rf",
+  "decision_threshold": 0.5,
+  "threshold_strategy": "default_0.5"
+}

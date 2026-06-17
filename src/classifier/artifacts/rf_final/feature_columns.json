@@ -1,0 +1,15 @@
+[
+  "transit_depth_est",
+  "transit_depth_snr",
+  "in_transit_fraction_est",
+  "autocorr_lag1",
+  "slope_linear",
+  "min_time_offset",
+  "skewness_flux",
+  "kurtosis_flux",
+  "depth_to_mad_ratio",
+  "ingress_egress_balance",
+  "p2p_to_std_ratio",
+  "binning_std_ratio",
+  "local_global_std_ratio"
+]
